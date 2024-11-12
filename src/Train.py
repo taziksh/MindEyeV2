@@ -19,6 +19,10 @@ import string
 import h5py
 from tqdm import tqdm
 import webdataset as wds
+# wandb.login()
+# run = wandb.init(
+#     project="mindeye-sae",
+# )
 
 import matplotlib.pyplot as plt
 import torch
@@ -151,7 +155,7 @@ parser.add_argument(
     help="whether to log to wandb",
 )
 parser.add_argument(
-    "--wandb_project",type=str,default="stability",
+    "--wandb_project",type=str,default="mindeye-sae",
     help="wandb project name",
 )
 parser.add_argument(
@@ -366,11 +370,32 @@ clip_img_embedder.to(device)
 clip_seq_dim = 256
 clip_emb_dim = 1664
 
-
 # ### SD VAE
 
 # In[10]:
 
+class SAE(nn.Module):
+    def __init__(self, input_dim, expansion_factor=64, sparsity_factor=1e-3):
+        super(SAE, self).__init__()
+
+        hidden_dim = input_dim * expansion_factor
+
+        self.encoder = nn.Linear(input_dim, hidden_dim)
+        self.decoder = nn.Linear(hidden_dim, input_dim)
+
+        self.sparsity_factor = sparsity_factor
+
+    def forward(self, x):
+        encoded = torch.relu(self.encoder(x))
+
+        loss = self.sparsity_factor * torch.mean(torch.abs(encoded))
+
+        decoded = self.decoder(encoded)
+
+        return decoded, loss
+
+sae = SAE(input_dim=clip_emb_dim, expansion_factor=64).to(device)
+sae_optimizer = torch.optim.Adam(sae.parameters(), lr=1e-4)
 
 if blurry_recon:
     from diffusers import AutoencoderKL    
@@ -388,6 +413,7 @@ if blurry_recon:
     autoenc.requires_grad_(False)
     autoenc.to(device)
     utils.count_params(autoenc)
+    print("L412")
     
     from autoencoder.convnext import ConvnextXL
     cnx = ConvnextXL(f'{cache_dir}/convnext_xlarge_alpha0.75_fullckpt.pth')
@@ -405,8 +431,9 @@ if blurry_recon:
         kornia.augmentation.RandomResizedCrop((224,224), scale=(.9,.9), ratio=(1,1), p=1.0),
         data_keys=["input"],
     )
+    print("L430")
 
-
+print("L432")
 # ### MindEye modules
 
 # In[11]:
@@ -581,7 +608,7 @@ num_params = utils.count_params(model)
 
 if local_rank==0 and wandb_log: # only use main process for wandb logging
     import wandb
-    wandb_project = 'mindeye'
+    wandb_project = 'mindeye-sae'
     print(f"wandb {wandb_project} run {model_name}")
     # need to configure wandb beforehand in terminal with "wandb init"!
     wandb_config = {
@@ -653,13 +680,16 @@ model, optimizer, *train_dls, lr_scheduler = accelerator.prepare(model, optimize
 
 
 print(f"{model_name} starting with epoch {epoch} / {num_epochs}")
-progress_bar = tqdm(range(epoch,num_epochs), ncols=1200, disable=(local_rank!=0))
+progress_bar = tqdm(range(epoch,num_epochs), ncols=1200, disable=(local_rank!=0))#, mininterval=10, file=sys.stdout)
 test_image, test_voxel = None, None
 mse = nn.MSELoss()
 l1 = nn.L1Loss()
 soft_loss_temps = utils.cosine_anneal(0.004, 0.0075, num_epochs - int(mixup_pct * num_epochs))
 
+print(f"progress_bar: {progress_bar}")
+
 for epoch in progress_bar:
+    print("L688")
     model.train()
 
     fwd_percent_correct = 0.
@@ -680,6 +710,9 @@ for epoch in progress_bar:
     loss_prior_total = 0.
     test_loss_prior_total = 0.
 
+    loss_sae_total = 0.
+    test_loss_sae_total = 0.
+
     blurry_pixcorr = 0.
     test_blurry_pixcorr = 0. # needs >.456 to beat low-level subj01 results in mindeye v1
 
@@ -688,7 +721,9 @@ for epoch in progress_bar:
     image_iters = torch.zeros(num_iterations_per_epoch, batch_size*len(subj_list), 3, 224, 224).float()
     annot_iters = {}
     perm_iters, betas_iters, select_iters = {}, {}, {}
+    print("L717")
     for s, train_dl in enumerate(train_dls):
+        print("L719")
         with torch.cuda.amp.autocast(dtype=data_type):
             iter = -1
             for behav0, past_behav0, future_behav0, old_behav0 in train_dl: 
@@ -720,6 +755,7 @@ for epoch in progress_bar:
 
     # you now have voxel_iters and image_iters with num_iterations_per_epoch batches each
     for train_i in range(num_iterations_per_epoch):
+        print("L751")
         with torch.cuda.amp.autocast(dtype=data_type):
             optimizer.zero_grad()
             loss=0.
@@ -733,6 +769,17 @@ for epoch in progress_bar:
 
             clip_target = clip_img_embedder(image)
             assert not torch.any(torch.isnan(clip_target))
+
+            print("before SAE")
+            recon, sparsity_loss = sae(clip_target)
+            print("-----SAE------")
+            print(f"Sparsity loss: {sparsity_loss}")
+
+            recon_loss = nn.MSELoss()(recon, clip_target)
+            sae_loss = recon_loss + sparsity_loss
+
+            loss += sae_loss
+            loss_sae_total += sae_loss.item()
 
             if epoch < int(mixup_pct * num_epochs):
                 perm_list = [perm_iters[f"subj0{s}_iter{train_i}"].detach().to(device) for s in subj_list]
@@ -938,6 +985,8 @@ for epoch in progress_bar:
                 "test/recon_mse": test_recon_mse / (test_i + 1),
                 "train/loss_prior": loss_prior_total / (train_i + 1),
                 "test/loss_prior": test_loss_prior_total / (test_i + 1),
+                "train/loss_sae": loss_sae_total / (train_i + 1),
+                "test/loss_sae": test_loss_sae_total / (test_i + 1),                
                 }
 
             # if finished training, save jpg recons if they exist
