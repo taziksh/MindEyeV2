@@ -58,7 +58,7 @@ num_devices = torch.cuda.device_count()
 if num_devices==0: num_devices = 1
 
 # First use "accelerate config" in terminal and setup using deepspeed stage 2 with CPU offloading!
-accelerator = Accelerator(split_batches=False, mixed_precision="fp16")
+accelerator = Accelerator(split_batches=False, mixed_precision="bf16")
 if utils.is_interactive(): # set batch size here if using interactive notebook instead of submitting job
     global_batch_size = batch_size = 8
 else:
@@ -149,6 +149,10 @@ parser.add_argument(
 parser.add_argument(
     "--batch_size", type=int, default=16,
     help="Batch size can be increased by 10x if only training retreival submodule and not diffusion prior",
+)
+parser.add_argument(
+    "--gradient_accumulation_steps", type=int, default=4,
+    help="Number of steps to accumulate gradients",
 )
 parser.add_argument(
     "--wandb_log",action=argparse.BooleanOptionalAction,default=False,
@@ -723,7 +727,7 @@ for epoch in progress_bar:
     perm_iters, betas_iters, select_iters = {}, {}, {}
     print("L717")
     for s, train_dl in enumerate(train_dls):
-        print("L719")
+        # print("L719")
         with torch.cuda.amp.autocast(dtype=data_type):
             iter = -1
             for behav0, past_behav0, future_behav0, old_behav0 in train_dl: 
@@ -754,6 +758,7 @@ for epoch in progress_bar:
                     break
 
     # you now have voxel_iters and image_iters with num_iterations_per_epoch batches each
+    print(f"Number of iterations per epoch: {num_iterations_per_epoch}")
     for train_i in range(num_iterations_per_epoch):
         print("L751")
         with torch.cuda.amp.autocast(dtype=data_type):
@@ -770,10 +775,10 @@ for epoch in progress_bar:
             clip_target = clip_img_embedder(image)
             assert not torch.any(torch.isnan(clip_target))
 
-            print("before SAE")
             recon, sparsity_loss = sae(clip_target)
             print("-----SAE------")
             print(f"Sparsity loss: {sparsity_loss}")
+            print(f"Iteration: {train_i}")
 
             recon_loss = nn.MSELoss()(recon, clip_target)
             sae_loss = recon_loss + sparsity_loss
@@ -862,14 +867,15 @@ for epoch in progress_bar:
                 with torch.no_grad():
                     # only doing pixcorr eval on a subset of the samples per batch because its costly & slow to compute autoenc.decode()
                     random_samps = np.random.choice(np.arange(len(image)), size=len(image)//5, replace=False)
+                    # print(f"image_enc_pred[random_samples] {image_enc_pred[random_samps]}")
                     blurry_recon_images = (autoenc.decode(image_enc_pred[random_samps]/0.18215).sample/ 2 + 0.5).clamp(0,1)
                     pixcorr = utils.pixcorr(image[random_samps], blurry_recon_images)
                     blurry_pixcorr += pixcorr.item()
 
             utils.check_loss(loss)
             accelerator.backward(loss)
+            
             optimizer.step()
-
             losses.append(loss.item())
             lrs.append(optimizer.param_groups[0]['lr'])
 
