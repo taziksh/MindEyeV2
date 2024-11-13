@@ -41,10 +41,13 @@ torch.backends.cuda.matmul.allow_tf32 = True
 # custom functions #
 import utils
 
+import gc
+gc.collect()
+torch.cuda.empty_cache()
 
 # In[2]:
 
-
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
 ### Multi-GPU config ###
 local_rank = os.getenv('RANK')
 if local_rank is None: 
@@ -53,12 +56,14 @@ else:
     local_rank = int(local_rank)
 print("LOCAL RANK ", local_rank)  
 
-data_type = torch.float16 # change depending on your mixed_precision
 num_devices = torch.cuda.device_count()
 if num_devices==0: num_devices = 1
 
 # First use "accelerate config" in terminal and setup using deepspeed stage 2 with CPU offloading!
-accelerator = Accelerator(split_batches=False, mixed_precision="bf16")
+
+# change depending on your mixed_precision
+data_type = torch.float16  #torch.bfloat16
+accelerator = Accelerator(split_batches=False, mixed_precision="fp16")
 if utils.is_interactive(): # set batch size here if using interactive notebook instead of submitting job
     global_batch_size = batch_size = 8
 else:
@@ -153,6 +158,10 @@ parser.add_argument(
 parser.add_argument(
     "--gradient_accumulation_steps", type=int, default=4,
     help="Number of steps to accumulate gradients",
+)
+parser.add_argument(
+    "--use_checkpointing", action=argparse.BooleanOptionalAction, default=True,
+    help="Whether to use gradient checkpointing to save memory",
 )
 parser.add_argument(
     "--wandb_log",action=argparse.BooleanOptionalAction,default=False,
@@ -410,20 +419,19 @@ if blurry_recon:
         layers_per_block=2,
         sample_size=256,
     )
-    ckpt = torch.load(f'{cache_dir}/sd_image_var_autoenc.pth')
+    ckpt = torch.load(f'{cache_dir}/sd_image_var_autoenc.pth', map_location='cpu')
     autoenc.load_state_dict(ckpt)
-    
     autoenc.eval()
     autoenc.requires_grad_(False)
-    autoenc.to(device)
+
+    # autoenc.to(device)
     utils.count_params(autoenc)
-    print("L412")
     
     from autoencoder.convnext import ConvnextXL
     cnx = ConvnextXL(f'{cache_dir}/convnext_xlarge_alpha0.75_fullckpt.pth')
     cnx.requires_grad_(False)
     cnx.eval()
-    cnx.to(device)
+    # cnx.to(device)
     
     mean = torch.tensor([0.485, 0.456, 0.406]).to(device).reshape(1,3,1,1)
     std = torch.tensor([0.228, 0.224, 0.225]).to(device).reshape(1,3,1,1)
@@ -435,9 +443,7 @@ if blurry_recon:
         kornia.augmentation.RandomResizedCrop((224,224), scale=(.9,.9), ratio=(1,1), p=1.0),
         data_keys=["input"],
     )
-    print("L430")
 
-print("L432")
 # ### MindEye modules
 
 # In[11]:
@@ -484,6 +490,7 @@ from models import BrainNetwork
 model.backbone = BrainNetwork(h=hidden_dim, in_dim=hidden_dim, seq_len=1, n_blocks=n_blocks,
                           clip_size=clip_emb_dim, out_dim=clip_emb_dim*clip_seq_dim, 
                           blurry_recon=blurry_recon, clip_scale=clip_scale)
+model.backbone.use_checkpointing = args.use_checkpointing
 utils.count_params(model.backbone)
 utils.count_params(model)
 
@@ -690,10 +697,7 @@ mse = nn.MSELoss()
 l1 = nn.L1Loss()
 soft_loss_temps = utils.cosine_anneal(0.004, 0.0075, num_epochs - int(mixup_pct * num_epochs))
 
-print(f"progress_bar: {progress_bar}")
-
 for epoch in progress_bar:
-    print("L688")
     model.train()
 
     fwd_percent_correct = 0.
@@ -725,9 +729,7 @@ for epoch in progress_bar:
     image_iters = torch.zeros(num_iterations_per_epoch, batch_size*len(subj_list), 3, 224, 224).float()
     annot_iters = {}
     perm_iters, betas_iters, select_iters = {}, {}, {}
-    print("L717")
     for s, train_dl in enumerate(train_dls):
-        # print("L719")
         with torch.cuda.amp.autocast(dtype=data_type):
             iter = -1
             for behav0, past_behav0, future_behav0, old_behav0 in train_dl: 
@@ -758,129 +760,161 @@ for epoch in progress_bar:
                     break
 
     # you now have voxel_iters and image_iters with num_iterations_per_epoch batches each
-    print(f"Number of iterations per epoch: {num_iterations_per_epoch}")
+    # print(f"Number of iterations per epoch: {num_iterations_per_epoch}")
     for train_i in range(num_iterations_per_epoch):
-        print("L751")
-        with torch.cuda.amp.autocast(dtype=data_type):
-            optimizer.zero_grad()
-            loss=0.
+        optimizer.zero_grad()
+        loss=0.
 
-            voxel_list = [voxel_iters[f"subj0{s}_iter{train_i}"].detach().to(device) for s in subj_list]
-            image = image_iters[train_i].detach()
-            image = image.to(device)
+        batch_size_per_accum = (batch_size*len(subj_list)) // args.gradient_accumulation_steps
 
-            if use_image_aug: 
-                image = img_augment(image)
+        for accum_step in range(args.gradient_accumulation_steps):
+            start_idx = accum_step * batch_size_per_accum
+            end_idx = start_idx + batch_size_per_accum            
 
-            clip_target = clip_img_embedder(image)
-            assert not torch.any(torch.isnan(clip_target))
+            with torch.cuda.amp.autocast(dtype=data_type):
+                voxel_list = [voxel_iters[f"subj0{s}_iter{train_i}"].detach().to(device) for s in subj_list]
+                image = image_iters[train_i].detach()
+                image = image.to(device)
 
-            recon, sparsity_loss = sae(clip_target)
-            print("-----SAE------")
-            print(f"Sparsity loss: {sparsity_loss}")
-            print(f"Iteration: {train_i}")
+                if use_image_aug: 
+                    image = img_augment(image)
 
-            recon_loss = nn.MSELoss()(recon, clip_target)
-            sae_loss = recon_loss + sparsity_loss
+                clip_target = clip_img_embedder(image)
+                assert not torch.any(torch.isnan(clip_target))
 
-            loss += sae_loss
-            loss_sae_total += sae_loss.item()
+                recon, sparsity_loss = sae(clip_target)
 
-            if epoch < int(mixup_pct * num_epochs):
-                perm_list = [perm_iters[f"subj0{s}_iter{train_i}"].detach().to(device) for s in subj_list]
-                perm = torch.cat(perm_list, dim=0)
-                betas_list = [betas_iters[f"subj0{s}_iter{train_i}"].detach().to(device) for s in subj_list]
-                betas = torch.cat(betas_list, dim=0)
-                select_list = [select_iters[f"subj0{s}_iter{train_i}"].detach().to(device) for s in subj_list]
-                select = torch.cat(select_list, dim=0)
+                recon_loss = nn.MSELoss()(recon, clip_target)
+                sae_loss = (recon_loss + sparsity_loss) / args.gradient_accumulation_steps
 
-            voxel_ridge_list = [model.ridge(voxel_list[si],si) for si,s in enumerate(subj_list)]
-            voxel_ridge = torch.cat(voxel_ridge_list, dim=0)
+                # print(f"Iteration: {train_i}")
+                # print(f"SAE loss: {sparsity_loss}")
 
-            backbone, clip_voxels, blurry_image_enc_ = model.backbone(voxel_ridge)
-
-            if clip_scale>0:
-                clip_voxels_norm = nn.functional.normalize(clip_voxels.flatten(1), dim=-1)
-                clip_target_norm = nn.functional.normalize(clip_target.flatten(1), dim=-1)
-
-            if use_prior:
-                loss_prior, prior_out = model.diffusion_prior(text_embed=backbone, image_embed=clip_target)
-                loss_prior_total += loss_prior.item()
-                loss_prior *= prior_scale
-                loss += loss_prior
-
-                recon_cossim += nn.functional.cosine_similarity(prior_out, clip_target).mean().item()
-                recon_mse += mse(prior_out, clip_target).item()
-
-            if clip_scale>0:
-                if epoch < int(mixup_pct * num_epochs):                
-                    loss_clip = utils.mixco_nce(
-                        clip_voxels_norm,
-                        clip_target_norm,
-                        temp=.006,
-                        perm=perm, betas=betas, select=select)
-                else:
-                    epoch_temp = soft_loss_temps[epoch-int(mixup_pct*num_epochs)]
-                    loss_clip = utils.soft_clip_loss(
-                        clip_voxels_norm,
-                        clip_target_norm,
-                        temp=epoch_temp)
-
-                loss_clip_total += loss_clip.item()
-                loss_clip *= clip_scale
-                loss += loss_clip
-
-            if blurry_recon:     
-                image_enc_pred, transformer_feats = blurry_image_enc_
-
-                image_enc = autoenc.encode(2*image-1).latent_dist.mode() * 0.18215
-                loss_blurry = l1(image_enc_pred, image_enc)
-                loss_blurry_total += loss_blurry.item()
+                loss += sae_loss
+                loss_sae_total += sae_loss.item()
 
                 if epoch < int(mixup_pct * num_epochs):
-                    image_enc_shuf = image_enc[perm]
-                    betas_shape = [-1] + [1]*(len(image_enc.shape)-1)
-                    image_enc[select] = image_enc[select] * betas[select].reshape(*betas_shape) + \
-                        image_enc_shuf[select] * (1 - betas[select]).reshape(*betas_shape)
+                    perm_list = [perm_iters[f"subj0{s}_iter{train_i}"].detach().to(device) for s in subj_list]
+                    perm = torch.cat(perm_list, dim=0)
+                    betas_list = [betas_iters[f"subj0{s}_iter{train_i}"].detach().to(device) for s in subj_list]
+                    betas = torch.cat(betas_list, dim=0)
+                    select_list = [select_iters[f"subj0{s}_iter{train_i}"].detach().to(device) for s in subj_list]
+                    select = torch.cat(select_list, dim=0)
 
-                image_norm = (image - mean)/std
-                image_aug = (blur_augs(image) - mean)/std
-                _, cnx_embeds = cnx(image_norm)
-                _, cnx_aug_embeds = cnx(image_aug)
+                voxel_ridge_list = [model.ridge(voxel_list[si],si) for si,s in enumerate(subj_list)]
+                voxel_ridge = torch.cat(voxel_ridge_list, dim=0)
 
-                cont_loss = utils.soft_cont_loss(
-                    nn.functional.normalize(transformer_feats.reshape(-1, transformer_feats.shape[-1]), dim=-1),
-                    nn.functional.normalize(cnx_embeds.reshape(-1, cnx_embeds.shape[-1]), dim=-1),
-                    nn.functional.normalize(cnx_aug_embeds.reshape(-1, cnx_embeds.shape[-1]), dim=-1),
-                    temp=0.2)
-                loss_blurry_cont_total += cont_loss.item()
+                backbone, clip_voxels, blurry_image_enc_ = model.backbone(voxel_ridge)
 
-                loss += (loss_blurry + 0.1*cont_loss) * blur_scale #/.18215
+                if clip_scale>0:
+                    clip_voxels_norm = nn.functional.normalize(clip_voxels.flatten(1), dim=-1)
+                    clip_target_norm = nn.functional.normalize(clip_target.flatten(1), dim=-1)
 
-            if clip_scale>0:
-                # forward and backward top 1 accuracy        
-                labels = torch.arange(len(clip_voxels_norm)).to(clip_voxels_norm.device) 
-                fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_voxels_norm, clip_target_norm), labels, k=1).item()
-                bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_target_norm, clip_voxels_norm), labels, k=1).item()
+                if use_prior:
+                    loss_prior, prior_out = model.diffusion_prior(text_embed=backbone, image_embed=clip_target)
+                    loss_prior_total += loss_prior.item()
+                    loss_prior = (loss_prior * prior_scale) / args.gradient_accumulation_steps
+                    loss += loss_prior
 
-            if blurry_recon:
-                with torch.no_grad():
-                    # only doing pixcorr eval on a subset of the samples per batch because its costly & slow to compute autoenc.decode()
-                    random_samps = np.random.choice(np.arange(len(image)), size=len(image)//5, replace=False)
-                    # print(f"image_enc_pred[random_samples] {image_enc_pred[random_samps]}")
-                    blurry_recon_images = (autoenc.decode(image_enc_pred[random_samps]/0.18215).sample/ 2 + 0.5).clamp(0,1)
-                    pixcorr = utils.pixcorr(image[random_samps], blurry_recon_images)
-                    blurry_pixcorr += pixcorr.item()
+                    recon_cossim += nn.functional.cosine_similarity(prior_out, clip_target).mean().item()
+                    recon_mse += mse(prior_out, clip_target).item()
 
-            utils.check_loss(loss)
-            accelerator.backward(loss)
-            
-            optimizer.step()
-            losses.append(loss.item())
-            lrs.append(optimizer.param_groups[0]['lr'])
+                if clip_scale>0:
+                    if epoch < int(mixup_pct * num_epochs):                
+                        loss_clip = utils.mixco_nce(
+                            clip_voxels_norm,
+                            clip_target_norm,
+                            temp=.006,
+                            perm=perm, betas=betas, select=select)
+                    else:
+                        epoch_temp = soft_loss_temps[epoch-int(mixup_pct*num_epochs)]
+                        loss_clip = utils.soft_clip_loss(
+                            clip_voxels_norm,
+                            clip_target_norm,
+                            temp=epoch_temp)
 
-            if lr_scheduler_type is not None:
-                lr_scheduler.step()
+                    loss_clip_total += loss_clip.item()
+                    loss_clip = (loss_clip * clip_scale) / args.gradient_accumulation_steps
+                    loss += loss_clip
+
+                if blurry_recon:     
+                    image_enc_pred, transformer_feats = blurry_image_enc_
+
+                    # Process in smaller chunks
+                    chunk_size = max(1, len(image) // 8)
+                    image_enc_list = []
+                    
+                    for i in range(0, len(image), chunk_size):
+                        image_chunk = image[i:i + chunk_size]
+                        
+                        autoenc = autoenc.to(device).to(data_type)
+                        with torch.cuda.amp.autocast(dtype=data_type):
+                            chunk_enc = autoenc.encode(2*image_chunk-1).latent_dist.mode() * 0.18215
+                        autoenc = autoenc.cpu()
+                        
+                        image_enc_list.append(chunk_enc.detach())
+                        del chunk_enc
+                        torch.cuda.empty_cache()
+                        gc.collect()
+                    
+                    image_enc = torch.cat(image_enc_list, dim=0)
+                    # torch.cuda.empty_cache()
+
+                    loss_blurry = l1(image_enc_pred, image_enc)
+                    loss_blurry_total += loss_blurry.item()
+
+                    if epoch < int(mixup_pct * num_epochs):
+                        image_enc_shuf = image_enc[perm]
+                        betas_shape = [-1] + [1]*(len(image_enc.shape)-1)
+                        image_enc[select] = image_enc[select] * betas[select].reshape(*betas_shape) + \
+                            image_enc_shuf[select] * (1 - betas[select]).reshape(*betas_shape)
+
+                    image_norm = (image - mean)/std
+                    image_aug = (blur_augs(image) - mean)/std
+
+                    cnx = cnx.to(device).to(data_type)
+                    _, cnx_embeds = cnx(image_norm)
+                    _, cnx_aug_embeds = cnx(image_aug)
+                    cnx = cnx.cpu()
+                    torch.cuda.empty_cache()
+
+                    cont_loss = utils.soft_cont_loss(
+                        nn.functional.normalize(transformer_feats.reshape(-1, transformer_feats.shape[-1]), dim=-1),
+                        nn.functional.normalize(cnx_embeds.reshape(-1, cnx_embeds.shape[-1]), dim=-1),
+                        nn.functional.normalize(cnx_aug_embeds.reshape(-1, cnx_embeds.shape[-1]), dim=-1),
+                        temp=0.2)
+                    loss_blurry_cont_total += cont_loss.item()
+
+                    loss += (loss_blurry + 0.1*cont_loss) * blur_scale / args.gradient_accumulation_steps #/.18215
+
+                if clip_scale>0:
+                    # forward and backward top 1 accuracy        
+                    labels = torch.arange(len(clip_voxels_norm)).to(clip_voxels_norm.device) 
+                    fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_voxels_norm, clip_target_norm), labels, k=1).item()
+                    bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_target_norm, clip_voxels_norm), labels, k=1).item()
+
+                if blurry_recon:
+                    with torch.no_grad():
+                        # only doing pixcorr eval on a subset of the samples per batch because its costly & slow to compute autoenc.decode()
+                        random_samps = np.random.choice(np.arange(len(image)), size=len(image)//5, replace=False)
+                        # print(f"image_enc_pred[random_samples] {image_enc_pred[random_samps]}")
+                        autoenc = autoenc.to(device).to(data_type)
+                        blurry_recon_images = (autoenc.decode(image_enc_pred[random_samps]/0.18215).sample/ 2 + 0.5).clamp(0,1)
+                        autoenc = autoenc.cpu()
+                        pixcorr = utils.pixcorr(image[random_samps], blurry_recon_images)
+                        blurry_pixcorr += pixcorr.item()
+
+                # loss = loss / args.gradient_accumulation_steps
+
+                utils.check_loss(loss)
+                accelerator.backward(loss, retain_graph=(accum_step < args.gradient_accumulation_steps-1))
+
+        optimizer.step()
+        losses.append(loss.item())
+        lrs.append(optimizer.param_groups[0]['lr'])
+
+        if lr_scheduler_type is not None:
+            lr_scheduler.step()
 
     model.eval()
     if local_rank==0:

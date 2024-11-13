@@ -3,6 +3,7 @@ import numpy as np
 from torchvision import transforms
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 import PIL
 import clip
 from functools import partial
@@ -51,6 +52,7 @@ class BrainNetwork(nn.Module):
                 nn.ReLU(True),
                 nn.Conv2d(512, 512, 1, bias=True),
             )
+        self.use_checkpointing = True
             
     def projector(self, in_dim, out_dim, h=2048):
         return nn.Sequential(
@@ -85,7 +87,7 @@ class BrainNetwork(nn.Module):
             self.mlp(seq_len, seq_len, drop)  # Channel mixing
         )
         
-    def forward(self, x):
+    def _forward(self, x):
         # make empty tensors
         c,b = torch.Tensor([0.]), torch.Tensor([[0.],[0.]])
         
@@ -116,6 +118,11 @@ class BrainNetwork(nn.Module):
             b = (self.bupsampler(b), b_aux)
         
         return backbone, c, b
+
+    def forward(self, x):
+        if self.use_checkpointing and self.training:
+            return checkpoint(self._forward, x, use_reentrant=False)
+        return self._forward(x)
     
 class Clipper(torch.nn.Module):
     def __init__(self, clip_variant, clamp_embs=False, norm_embs=False,
