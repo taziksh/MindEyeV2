@@ -13,6 +13,27 @@ from tqdm import tqdm
 import utils
 
 from diffusers.models.vae import Decoder
+
+class SAE(nn.Module):
+    def __init__(self, input_dim, expansion_factor=64, sparsity_factor=1e-3):
+        super(SAE, self).__init__()
+
+        hidden_dim = input_dim * expansion_factor
+
+        self.encoder = nn.Linear(input_dim, hidden_dim)
+        self.decoder = nn.Linear(hidden_dim, input_dim)
+
+        self.sparsity_factor = sparsity_factor
+
+    def forward(self, x):
+        encoded = torch.relu(self.encoder(x))
+
+        loss = self.sparsity_factor * torch.mean(torch.abs(encoded))
+
+        decoded = self.decoder(encoded)
+
+        return decoded, loss
+
 class BrainNetwork(nn.Module):
     def __init__(self, h=4096, in_dim=15724, out_dim=768, seq_len=2, n_blocks=4, drop=.15, clip_size=768, blurry_recon=True, clip_scale=1):
         super().__init__()

@@ -8,6 +8,7 @@
 
 import os
 import sys
+from datetime import timedelta
 import json
 import argparse
 import numpy as np
@@ -28,7 +29,9 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 from torchvision import transforms
-from accelerate import Accelerator
+from accelerate import Accelerator, InitProcessGroupKwargs
+
+from models import BrainNetwork, SAE
 
 # SDXL unCLIP requires code from https://github.com/Stability-AI/generative-models/tree/main
 sys.path.append('generative_models/')
@@ -41,9 +44,9 @@ torch.backends.cuda.matmul.allow_tf32 = True
 # custom functions #
 import utils
 
-import gc
-gc.collect()
-torch.cuda.empty_cache()
+# import gc
+# gc.collect()
+# torch.cuda.empty_cache()
 
 # In[2]:
 
@@ -62,8 +65,8 @@ if num_devices==0: num_devices = 1
 # First use "accelerate config" in terminal and setup using deepspeed stage 2 with CPU offloading!
 
 # change depending on your mixed_precision
-data_type = torch.float16  #torch.bfloat16
-accelerator = Accelerator(split_batches=False, mixed_precision="fp16")
+data_type = torch.bfloat16
+accelerator = Accelerator(split_batches=False, mixed_precision="bf16", kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(hours=0.5))])
 if utils.is_interactive(): # set batch size here if using interactive notebook instead of submitting job
     global_batch_size = batch_size = 8
 else:
@@ -156,7 +159,7 @@ parser.add_argument(
     help="Batch size can be increased by 10x if only training retreival submodule and not diffusion prior",
 )
 parser.add_argument(
-    "--gradient_accumulation_steps", type=int, default=4,
+    "--gradient_accumulation_steps", type=int, default=1,
     help="Number of steps to accumulate gradients",
 )
 parser.add_argument(
@@ -387,25 +390,16 @@ clip_emb_dim = 1664
 
 # In[10]:
 
-class SAE(nn.Module):
-    def __init__(self, input_dim, expansion_factor=64, sparsity_factor=1e-3):
-        super(SAE, self).__init__()
 
-        hidden_dim = input_dim * expansion_factor
-
-        self.encoder = nn.Linear(input_dim, hidden_dim)
-        self.decoder = nn.Linear(hidden_dim, input_dim)
-
-        self.sparsity_factor = sparsity_factor
-
-    def forward(self, x):
-        encoded = torch.relu(self.encoder(x))
-
-        loss = self.sparsity_factor * torch.mean(torch.abs(encoded))
-
-        decoded = self.decoder(encoded)
-
-        return decoded, loss
+def analyze_decoder_weights(sae_model):
+    decoder_weights = sae_model.decoder.weight.detach()
+    l2_norms = torch.norm(decoder_weights, dim=1)
+    return {
+        "mean_norm": l2_norms.mean().item(),
+        "std_norm": l2_norms.std().item(),
+        "min_norm": l2_norms.min().item(),
+        "max_norm": l2_norms.max().item()
+    }
 
 sae = SAE(input_dim=clip_emb_dim, expansion_factor=64).to(device)
 sae_optimizer = torch.optim.Adam(sae.parameters(), lr=1e-4)
@@ -486,7 +480,6 @@ print(b.shape, model.ridge(b,0).shape)
 # In[13]:
 
 
-from models import BrainNetwork
 model.backbone = BrainNetwork(h=hidden_dim, in_dim=hidden_dim, seq_len=1, n_blocks=n_blocks,
                           clip_size=clip_emb_dim, out_dim=clip_emb_dim*clip_seq_dim, 
                           blurry_recon=blurry_recon, clip_scale=clip_scale)
@@ -584,6 +577,7 @@ def save_ckpt(tag):
         torch.save({
             'epoch': epoch,
             'model_state_dict': unwrapped_model.state_dict(),
+            'sae_state_dict': sae.state_dict(),     
             'optimizer_state_dict': optimizer.state_dict(),
             'lr_scheduler': lr_scheduler.state_dict(),
             'train_losses': losses,
@@ -596,6 +590,7 @@ def load_ckpt(tag,load_lr=True,load_optimizer=True,load_epoch=True,strict=True,o
     print(f"\n---loading {outdir}/{tag}.pth ckpt---\n")
     checkpoint = torch.load(outdir+'/last.pth', map_location='cpu')
     state_dict = checkpoint['model_state_dict']
+    sae.load_state_dict(checkpoint['sae_state_dict'], strict=strict)   
     if multisubj_loading: # remove incompatible ridge layer that will otherwise error
         state_dict.pop('ridge.linears.0.weight',None)
     model.load_state_dict(state_dict, strict=strict)
@@ -649,9 +644,9 @@ if local_rank==0 and wandb_log: # only use main process for wandb logging
     print("wandb_config:\n",wandb_config)
     print("wandb_id:",model_name)
     wandb.init(
-        id=model_name,
+        # id=model_name,
         project=wandb_project,
-        name=model_name,
+        # name=model_name,
         config=wandb_config,
         resume="allow",
     )
@@ -667,7 +662,7 @@ else:
 epoch = 0
 losses, test_losses, lrs = [], [], []
 best_test_loss = 1e9
-torch.cuda.empty_cache()
+# torch.cuda.empty_cache()
 
 
 # In[18]:
@@ -782,13 +777,22 @@ for epoch in progress_bar:
                 clip_target = clip_img_embedder(image)
                 assert not torch.any(torch.isnan(clip_target))
 
-                recon, sparsity_loss = sae(clip_target)
+                if train_i % 10 == 0 and train_i != 0:
+                    weight_stats = analyze_decoder_weights(sae)
+                    if wandb_log:
+                        wandb.log({
+                            "sae/decoder_l2_mean": weight_stats["mean_norm"],
+                            "sae/decoder_l2_std": weight_stats["std_norm"],
+                            "sae/decoder_l2_min": weight_stats["min_norm"], 
+                            "sae/decoder_l2_max": weight_stats["max_norm"]
+                        })                
 
+                recon, sparsity_loss = sae(clip_target)
                 recon_loss = nn.MSELoss()(recon, clip_target)
                 sae_loss = (recon_loss + sparsity_loss) / args.gradient_accumulation_steps
 
-                # print(f"Iteration: {train_i}")
-                # print(f"SAE loss: {sparsity_loss}")
+                if train_i % 10 == 0:
+                    print(f"SAE loss: {sae_loss.item():.6f} (recon: {recon_loss.item():.6f}, sparsity: {sparsity_loss.item():.6f})")
 
                 loss += sae_loss
                 loss_sae_total += sae_loss.item()
@@ -840,26 +844,7 @@ for epoch in progress_bar:
                 if blurry_recon:     
                     image_enc_pred, transformer_feats = blurry_image_enc_
 
-                    # Process in smaller chunks
-                    chunk_size = max(1, len(image) // 8)
-                    image_enc_list = []
-                    
-                    for i in range(0, len(image), chunk_size):
-                        image_chunk = image[i:i + chunk_size]
-                        
-                        autoenc = autoenc.to(device).to(data_type)
-                        with torch.cuda.amp.autocast(dtype=data_type):
-                            chunk_enc = autoenc.encode(2*image_chunk-1).latent_dist.mode() * 0.18215
-                        autoenc = autoenc.cpu()
-                        
-                        image_enc_list.append(chunk_enc.detach())
-                        del chunk_enc
-                        torch.cuda.empty_cache()
-                        gc.collect()
-                    
-                    image_enc = torch.cat(image_enc_list, dim=0)
-                    # torch.cuda.empty_cache()
-
+                    image_enc = autoenc.encode(2*image-1).latent_dist.mode() * 0.18215
                     loss_blurry = l1(image_enc_pred, image_enc)
                     loss_blurry_total += loss_blurry.item()
 
@@ -871,12 +856,8 @@ for epoch in progress_bar:
 
                     image_norm = (image - mean)/std
                     image_aug = (blur_augs(image) - mean)/std
-
-                    cnx = cnx.to(device).to(data_type)
                     _, cnx_embeds = cnx(image_norm)
                     _, cnx_aug_embeds = cnx(image_aug)
-                    cnx = cnx.cpu()
-                    torch.cuda.empty_cache()
 
                     cont_loss = utils.soft_cont_loss(
                         nn.functional.normalize(transformer_feats.reshape(-1, transformer_feats.shape[-1]), dim=-1),
@@ -898,9 +879,9 @@ for epoch in progress_bar:
                         # only doing pixcorr eval on a subset of the samples per batch because its costly & slow to compute autoenc.decode()
                         random_samps = np.random.choice(np.arange(len(image)), size=len(image)//5, replace=False)
                         # print(f"image_enc_pred[random_samples] {image_enc_pred[random_samps]}")
-                        autoenc = autoenc.to(device).to(data_type)
+                        # autoenc = autoenc.to(device).to(data_type)
                         blurry_recon_images = (autoenc.decode(image_enc_pred[random_samps]/0.18215).sample/ 2 + 0.5).clamp(0,1)
-                        autoenc = autoenc.cpu()
+                        # autoenc = autoenc.cpu()
                         pixcorr = utils.pixcorr(image[random_samps], blurry_recon_images)
                         blurry_pixcorr += pixcorr.item()
 
