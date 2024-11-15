@@ -571,6 +571,7 @@ elif lr_scheduler_type == 'cycle':
     )
     
 def save_ckpt(tag):
+    print(f"\nSaving checkpoint for epoch {epoch}...")
     ckpt_path = outdir+f'/{tag}.pth'
     if accelerator.is_main_process:
         unwrapped_model = accelerator.unwrap_model(model)
@@ -797,6 +798,9 @@ for epoch in progress_bar:
                 loss += sae_loss
                 loss_sae_total += sae_loss.item()
 
+                if train_i % 50 == 0:
+                    print(f"Starting backbone forward pass...")                
+
                 if epoch < int(mixup_pct * num_epochs):
                     perm_list = [perm_iters[f"subj0{s}_iter{train_i}"].detach().to(device) for s in subj_list]
                     perm = torch.cat(perm_list, dim=0)
@@ -808,6 +812,9 @@ for epoch in progress_bar:
                 voxel_ridge_list = [model.ridge(voxel_list[si],si) for si,s in enumerate(subj_list)]
                 voxel_ridge = torch.cat(voxel_ridge_list, dim=0)
 
+                if train_i % 50 == 0:
+                    print(f"Completed ridge, starting backbone...")
+
                 backbone, clip_voxels, blurry_image_enc_ = model.backbone(voxel_ridge)
 
                 if clip_scale>0:
@@ -815,7 +822,12 @@ for epoch in progress_bar:
                     clip_target_norm = nn.functional.normalize(clip_target.flatten(1), dim=-1)
 
                 if use_prior:
+                    if train_i % 50 == 0:
+                        print("Starting prior loss calculation...")                    
                     loss_prior, prior_out = model.diffusion_prior(text_embed=backbone, image_embed=clip_target)
+                    if train_i % 50 == 0:
+                        print(f"Prior loss: {loss_prior.item():.6f}")                    
+                    
                     loss_prior_total += loss_prior.item()
                     loss_prior = (loss_prior * prior_scale) / args.gradient_accumulation_steps
                     loss += loss_prior
@@ -824,7 +836,9 @@ for epoch in progress_bar:
                     recon_mse += mse(prior_out, clip_target).item()
 
                 if clip_scale>0:
-                    if epoch < int(mixup_pct * num_epochs):                
+                    if epoch < int(mixup_pct * num_epochs):    
+                        if train_i % 50 == 0:
+                            print("Starting mixup operations...")                                    
                         loss_clip = utils.mixco_nce(
                             clip_voxels_norm,
                             clip_target_norm,
@@ -890,6 +904,11 @@ for epoch in progress_bar:
                 utils.check_loss(loss)
                 accelerator.backward(loss, retain_graph=(accum_step < args.gradient_accumulation_steps-1))
 
+        if train_i % 50 == 0:
+            print(f"Training iteration {train_i}/{num_iterations_per_epoch}")
+            print(f"Current loss: {loss.item():.4f}")
+
+
         optimizer.step()
         losses.append(loss.item())
         lrs.append(optimizer.param_groups[0]['lr'])
@@ -899,6 +918,7 @@ for epoch in progress_bar:
 
     model.eval()
     if local_rank==0:
+        print(f"\nStarting validation for epoch {epoch}...")
         with torch.no_grad(), torch.cuda.amp.autocast(dtype=data_type): 
             for test_i, (behav, past_behav, future_behav, old_behav) in enumerate(test_dl):  
                 # all test samples should be loaded per batch such that test_i should never exceed 0
@@ -983,6 +1003,10 @@ for epoch in progress_bar:
                 
                 utils.check_loss(loss)                
                 test_losses.append(loss.item())
+
+                if test_i % 50 == 0:
+                    print(f"Validation iteration {test_i}")
+                    print(f"Current test loss: {loss.item():.4f}")                
 
             assert (test_i+1) == 1
             logs = {"train/loss": np.mean(losses[-(train_i+1):]),
