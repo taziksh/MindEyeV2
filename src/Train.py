@@ -401,8 +401,8 @@ def analyze_decoder_weights(sae_model):
         "max_norm": l2_norms.max().item()
     }
 
-sae = SAE(input_dim=clip_emb_dim, expansion_factor=64).to(device)
-sae_optimizer = torch.optim.Adam(sae.parameters(), lr=1e-4)
+sae = SAE(input_dim=clip_emb_dim, expansion_factor=64)#.to(device)
+# sae_optimizer = torch.optim.Adam(sae.parameters(), lr=1e-4)
 
 if blurry_recon:
     from diffusers import AutoencoderKL    
@@ -470,6 +470,10 @@ class RidgeRegression(torch.nn.Module):
         
 model.ridge = RidgeRegression(num_voxels_list, out_features=hidden_dim)
 utils.count_params(model.ridge)
+utils.count_params(model)
+
+model.sae = sae
+utils.count_params(model.sae)
 utils.count_params(model)
 
 # test on subject 1 with fake data
@@ -545,13 +549,18 @@ opt_grouped_parameters = [
     {'params': [p for n, p in model.backbone.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': 1e-2},
     {'params': [p for n, p in model.backbone.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0},
 ]
+
 if use_prior:
     opt_grouped_parameters.extend([
         {'params': [p for n, p in model.diffusion_prior.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': 1e-2},
         {'params': [p for n, p in model.diffusion_prior.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
     ])
 
-optimizer = torch.optim.AdamW(opt_grouped_parameters, lr=max_lr)
+optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=max_lr,
+    weight_decay=1e-2
+)
 
 if lr_scheduler_type == 'linear':
     lr_scheduler = torch.optim.lr_scheduler.LinearLR(
@@ -572,32 +581,57 @@ elif lr_scheduler_type == 'cycle':
     
 def save_ckpt(tag):
     print(f"\nSaving checkpoint for epoch {epoch}...")
-    ckpt_path = outdir+f'/{tag}.pth'
-    if accelerator.is_main_process:
-        unwrapped_model = accelerator.unwrap_model(model)
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': unwrapped_model.state_dict(),
-            'sae_state_dict': sae.state_dict(),     
-            'optimizer_state_dict': optimizer.state_dict(),
-            'lr_scheduler': lr_scheduler.state_dict(),
-            'train_losses': losses,
-            'test_losses': test_losses,
-            'lrs': lrs,
-            }, ckpt_path)
-    print(f"\n---saved {outdir}/{tag} ckpt!---\n")
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    ckpt_path = os.path.join(outdir, f'{tag}_{timestamp}.pth')
 
-def load_ckpt(tag,load_lr=True,load_optimizer=True,load_epoch=True,strict=True,outdir=outdir,multisubj_loading=False): 
+    print(f"Output directory exists? {os.path.exists(outdir)}")
+    print(f"Full checkpoint path: {os.path.abspath(ckpt_path)}")
+    
+    if accelerator.is_main_process:
+        try:
+            unwrapped_model = accelerator.unwrap_model(model)
+            checkpoint_dict = {
+                'epoch': epoch,
+                'model_state_dict': unwrapped_model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'lr_scheduler': lr_scheduler.state_dict(),
+                'train_losses': losses,
+                'test_losses': test_losses,
+                'lrs': lrs,
+            }
+            print("Checkpoint dictionary created successfully")
+            
+            torch.save(checkpoint_dict, ckpt_path)
+            print(f"Checkpoint saved successfully")
+            print(f"File exists after saving? {os.path.exists(ckpt_path)}")
+            
+        except Exception as e:
+            print(f"Error saving checkpoint: {str(e)}")
+            print(f"Current working directory: {os.getcwd()}")
+            
+    print(f"\n---attempted save to: {ckpt_path} ---\n")
+
+def load_ckpt(tag, load_lr=True, load_optimizer=True, load_epoch=True, strict=True, outdir=outdir, multisubj_loading=False): 
     print(f"\n---loading {outdir}/{tag}.pth ckpt---\n")
     checkpoint = torch.load(outdir+'/last.pth', map_location='cpu')
     state_dict = checkpoint['model_state_dict']
-    sae.load_state_dict(checkpoint['sae_state_dict'], strict=strict)   
-    if multisubj_loading: # remove incompatible ridge layer that will otherwise error
-        state_dict.pop('ridge.linears.0.weight',None)
+
+   # Handle old checkpoints
+    if 'sae_state_dict' in checkpoint:
+        # Merge sae_state_dict into state_dict
+        sae_state_dict = checkpoint['sae_state_dict']
+        # Prefix 'sae.' to the keys in sae_state_dict to match the new model structure
+        sae_state_dict = {f'sae.{k}': v for k, v in sae_state_dict.items()}
+        # Update state_dict with sae_state_dict
+        state_dict.update(sae_state_dict)
+        print("Merged 'sae_state_dict' into 'model_state_dict'")
+
+    if multisubj_loading:  # remove incompatible ridge layer that will otherwise error
+        state_dict.pop('ridge.linears.0.weight', None)
     model.load_state_dict(state_dict, strict=strict)
     if load_epoch:
         globals()["epoch"] = checkpoint['epoch']
-        print("Epoch",epoch)
+        print("Epoch", epoch)
     if load_optimizer:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     if load_lr:
@@ -679,8 +713,9 @@ if multisubject_ckpt is not None:
 
 train_dls = [train_dl[f'subj0{s}'] for s in subj_list]
 
-model, optimizer, *train_dls, lr_scheduler = accelerator.prepare(model, optimizer, *train_dls, lr_scheduler)
-# leaving out test_dl since we will only have local_rank 0 device do evals
+model, optimizer, *train_dls, lr_scheduler = accelerator.prepare(
+    model, optimizer, *train_dls, lr_scheduler
+)# leaving out test_dl since we will only have local_rank 0 device do evals
 
 
 # In[20]:
@@ -779,7 +814,7 @@ for epoch in progress_bar:
                 assert not torch.any(torch.isnan(clip_target))
 
                 if train_i % 10 == 0 and train_i != 0:
-                    weight_stats = analyze_decoder_weights(sae)
+                    weight_stats = analyze_decoder_weights(model.sae)
                     if wandb_log:
                         wandb.log({
                             "sae/decoder_l2_mean": weight_stats["mean_norm"],
@@ -788,7 +823,7 @@ for epoch in progress_bar:
                             "sae/decoder_l2_max": weight_stats["max_norm"]
                         })                
 
-                recon, sparsity_loss = sae(clip_target)
+                recon, sparsity_loss = model.sae(clip_target)
                 recon_loss = nn.MSELoss()(recon, clip_target)
                 sae_loss = (recon_loss + sparsity_loss) / args.gradient_accumulation_steps
 
@@ -903,6 +938,10 @@ for epoch in progress_bar:
 
                 utils.check_loss(loss)
                 accelerator.backward(loss, retain_graph=(accum_step < args.gradient_accumulation_steps-1))
+
+                for name, param in model.sae.named_parameters():
+                    if param.grad is not None:
+                        print(f"Gradient for {name}: {param.grad.norm()}")
 
         if train_i % 50 == 0:
             print(f"Training iteration {train_i}/{num_iterations_per_epoch}")
