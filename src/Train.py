@@ -31,7 +31,7 @@ import torch.nn as nn
 from torchvision import transforms
 from accelerate import Accelerator, InitProcessGroupKwargs
 
-from models import BrainNetwork, SAE
+from models import BrainNetwork, SAE, MindEyeModule, RidgeRegression
 
 # SDXL unCLIP requires code from https://github.com/Stability-AI/generative-models/tree/main
 sys.path.append('generative_models/')
@@ -442,12 +442,6 @@ if blurry_recon:
 
 # In[11]:
 
-
-class MindEyeModule(nn.Module):
-    def __init__(self):
-        super(MindEyeModule, self).__init__()
-    def forward(self, x):
-        return x
         
 model = MindEyeModule()
 model
@@ -455,18 +449,6 @@ model
 
 # In[12]:
 
-
-class RidgeRegression(torch.nn.Module):
-    # make sure to add weight_decay when initializing optimizer to enable regularization
-    def __init__(self, input_sizes, out_features): 
-        super(RidgeRegression, self).__init__()
-        self.out_features = out_features
-        self.linears = torch.nn.ModuleList([
-                torch.nn.Linear(input_size, out_features) for input_size in input_sizes
-            ])
-    def forward(self, x, subj_idx):
-        out = self.linears[subj_idx](x[:,0]).unsqueeze(1)
-        return out
         
 model.ridge = RidgeRegression(num_voxels_list, out_features=hidden_dim)
 utils.count_params(model.ridge)

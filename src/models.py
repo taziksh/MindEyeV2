@@ -14,6 +14,24 @@ import utils
 
 from diffusers.models.vae import Decoder
 
+class RidgeRegression(torch.nn.Module):
+    # make sure to add weight_decay when initializing optimizer to enable regularization
+    def __init__(self, input_sizes, out_features): 
+        super(RidgeRegression, self).__init__()
+        self.out_features = out_features
+        self.linears = torch.nn.ModuleList([
+                torch.nn.Linear(input_size, out_features) for input_size in input_sizes
+            ])
+    def forward(self, x, subj_idx):
+        out = self.linears[subj_idx](x[:,0]).unsqueeze(1)
+        return out
+
+class MindEyeModule(nn.Module):
+    def __init__(self):
+        super(MindEyeModule, self).__init__()
+    def forward(self, x):
+        return x
+
 class SAE(nn.Module):
     def __init__(self, input_dim, expansion_factor=64, sparsity_factor=1e-3):
         super(SAE, self).__init__()
@@ -27,12 +45,13 @@ class SAE(nn.Module):
 
     def forward(self, x):
         encoded = torch.relu(self.encoder(x))
-
-        loss = self.sparsity_factor * torch.mean(torch.abs(encoded))
-
         decoded = self.decoder(encoded)
 
-        return decoded, loss
+        if self.training:
+            loss = self.sparsity_factor * torch.mean(torch.abs(encoded))
+            return decoded, loss
+        else:
+            return decoded, encoded 
 
 class BrainNetwork(nn.Module):
     def __init__(self, h=4096, in_dim=15724, out_dim=768, seq_len=2, n_blocks=4, drop=.15, clip_size=768, blurry_recon=True, clip_scale=1):
