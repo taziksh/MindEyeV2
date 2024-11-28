@@ -1,4 +1,6 @@
 import os
+from datetime import timedelta
+
 import sys
 import torch
 from models import SAE, MindEyeModule, RidgeRegression, BrainNetwork, BrainDiffusionPrior, PriorNetwork
@@ -11,12 +13,41 @@ import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import normalize
 import plotly.express as px
+from sklearn.cluster import MiniBatchKMeans
 
 
 # SDXL unCLIP requires code from https://github.com/Stability-AI/generative-models/tree/main
 sys.path.append('generative_models/')
 import sgm
 from generative_models.sgm.modules.encoders.modules import FrozenOpenCLIPImageEmbedder # bigG embedder
+
+torch.backends.cuda.matmul.allow_tf32 = True
+
+from accelerate import Accelerator, InitProcessGroupKwargs
+import utils
+
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
+### Multi-GPU config ###
+local_rank = os.getenv('RANK')
+if local_rank is None: 
+    local_rank = 0
+else:
+    local_rank = int(local_rank)
+print("LOCAL RANK ", local_rank)  
+
+num_devices = torch.cuda.device_count()
+if num_devices==0: num_devices = 1
+
+# First use "accelerate config" in terminal and setup using deepspeed stage 2 with CPU offloading!
+
+# change depending on your mixed_precision
+data_type = torch.bfloat16
+accelerator = Accelerator(split_batches=False, mixed_precision="bf16", kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(hours=0.5))])
+if utils.is_interactive(): # set batch size here if using interactive notebook instead of submitting job
+    global_batch_size = batch_size = 8
+else:
+    global_batch_size = os.environ["GLOBAL_BATCH_SIZE"]
+    batch_size = int(os.environ["GLOBAL_BATCH_SIZE"]) // num_devices
 
 def my_split_by_node(urls): return urls
 
@@ -148,31 +179,82 @@ def extract_feature_directions(sae):
     feature_directions = sae.encoder.weight.data.cpu().numpy().T  # Shape: [input_dim, hidden_dim]
     return feature_directions
 
-# Step 3: Extract Encoded Features (F) and Activations (A)
-def extract_sae_activations(sae, dataloader, images, clip_embedder, device):
+# Step 3: Extract SAE Activations (A)
+def extract_sae_activations(
+    sae, dataloader, images, clip_embedder, device, accelerator, output_dir="activations"
+):
+    """
+    Each process writes activations to a separate .npy file for simplicity.
+    """
     sae.eval()
     clip_embedder.eval()
-    activations = []
-    batch_size = 32  # Process in smaller batches
+
+    rank = accelerator.state.process_index
+    local_activations = []
+
+    os.makedirs(output_dir, exist_ok=True)
+    file_path = os.path.join(output_dir, f"activations_rank_{rank}.npy")
 
     with torch.no_grad():
         for behav, _, _, _ in dataloader:
             # Extract the image indices
             image_idx = behav[:, 0, 0].cpu().long().numpy()
-            
-            # Load images directly without storing in memory
             images_batch = torch.tensor(images[image_idx], dtype=torch.float32).to(device)
 
             with torch.cuda.amp.autocast():
                 clip_target = clip_embedder(images_batch)
-                decoded, encoded = sae(clip_target)
-                activations.append(encoded.cpu().numpy())
-                
-            # Explicitly clear cache after each batch
-            torch.cuda.empty_cache()
+                _, encoded = sae(clip_target)
 
-    activations = np.vstack(activations)
-    return activations
+            # Append activations to buffer
+            local_activations.append(encoded.cpu().numpy())
+
+            # Write incrementally to avoid memory buildup
+            if len(local_activations) >= 10:
+                append_to_numpy(file_path, local_activations)
+                local_activations = []
+
+    # Write any remaining activations
+    if local_activations:
+        append_to_numpy(file_path, local_activations)
+
+    print(f"Rank {rank}: Activations saved to {file_path}")
+    accelerator.wait_for_everyone()
+
+
+def append_to_numpy(file_path, data):
+    """
+    Append data to a .npy file. If file doesn't exist, create it.
+    """
+    data = np.vstack(data)
+    print(f"Appending data of shape {data.shape} to {file_path}")
+    
+    if not os.path.exists(file_path):
+        print(f"Creating new file at {file_path}")
+        np.save(file_path, data)
+        print(f"Saved initial data of shape {data.shape}")
+    else:
+        print(f"Loading existing data from {file_path}")
+        existing_data = np.load(file_path, mmap_mode="r+")
+        
+        combined_data = np.vstack([existing_data, data])
+        
+        np.save(file_path, combined_data)
+        print(f"Successfully saved combined data to {file_path}")
+
+def merge_numpy_files(input_dir, output_file="merged_activations.npy"):
+    """
+    Merge all rank-specific .npy files into a single file.
+    """
+    all_activations = []
+    for rank_file in sorted(os.listdir(input_dir)):
+        if rank_file.startswith("activations_rank_"):
+            rank_data = np.load(os.path.join(input_dir, rank_file), mmap_mode="r+")
+            all_activations.append(rank_data)
+
+    # Concatenate and save to a single file
+    all_activations = np.vstack(all_activations)
+    np.save(output_file, all_activations)
+    print(f"Merged activations saved to {output_file}")        
 
 # Step 4: Perform Spherical K-Means
 def spherical_kmeans(features, activations, k_range, tau, n_init=10):
@@ -208,66 +290,183 @@ def spherical_kmeans(features, activations, k_range, tau, n_init=10):
         "cluster_labels": best_labels
     }
 
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import normalize
+import numpy as np
+
+
+def incremental_spherical_kmeans_with_mass(
+    hdf5_path, 
+    features, 
+    k_range, 
+    tau, 
+    batch_size=256, 
+    n_init=10
+):
+    """
+    Perform spherical K-Means clustering incrementally with activation mass thresholds.
+
+    Parameters:
+        hdf5_path (str): Path to HDF5 file containing activations.
+        features (ndarray): Normalized feature directions, shape [input_dim, hidden_dim].
+        k_range (range): Range of cluster numbers to evaluate.
+        tau (float): Minimum activation mass threshold for each cluster.
+        batch_size (int): Number of samples to process per chunk.
+        n_init (int): Number of K-Means initializations.
+
+    Returns:
+        dict: Containing `best_k` and `cluster_labels` for the optimal clustering.
+    """
+    # Normalize features for spherical K-Means
+    normalized_features = normalize(features.T, axis=1, norm="l2")  # Shape: [hidden_dim, input_dim]
+
+    best_k, best_labels = None, None
+
+    # Iterate over cluster sizes in k_range
+    for k in k_range:
+        print(f"Trying k = {k}")
+
+        # Initialize KMeans
+        kmeans = KMeans(n_clusters=k, init="k-means++", n_init=n_init, random_state=42)
+
+        # Incrementally fit K-Means using HDF5 activations
+        with h5py.File(hdf5_path, "r") as h5f:
+            activations_dataset = h5f["activations"]
+            num_samples = activations_dataset.shape[0]
+
+            for start_idx in range(0, num_samples, batch_size):
+                end_idx = min(start_idx + batch_size, num_samples)
+                chunk = activations_dataset[start_idx:end_idx]
+
+                # Normalize chunk for spherical K-Means
+                normalized_chunk = normalize(chunk, axis=1, norm="l2")
+                kmeans.partial_fit(normalized_chunk)  # Incremental fitting
+
+        # Predict cluster labels for normalized features
+        cluster_labels = kmeans.predict(normalized_features)
+
+        # Compute activation mass per cluster
+        activation_mass = []
+        for cluster_idx in range(k):
+            cluster_mask = cluster_labels == cluster_idx
+            cluster_activation_mass = normalized_features[cluster_mask].sum(axis=0)
+            activation_mass.append(cluster_activation_mass)
+
+        print(f"K={k}, Activation Masses: {activation_mass}")
+
+        # Check if all clusters meet the activation mass threshold
+        if all(am >= tau for am in activation_mass):
+            best_k, best_labels = k, cluster_labels
+        else:
+            break  # Stop if any cluster fails the activation mass threshold
+
+    return {
+        "best_k": best_k,
+        "cluster_labels": best_labels
+    }
+
 
 # Step 5: Visualization
-def visualize_clusters(features, cluster_labels):
+def visualize_clusters(hdf5_path, kmeans, output_path="spherical_kmeans_visualization.png"):
     from sklearn.decomposition import PCA
-    # features: normalized feature directions, shape [hidden_dim, input_dim]
-    pca = PCA(n_components=2)
-    reduced_features = pca.fit_transform(features)  # Shape: [hidden_dim, 2]
 
-    # Scatter plot of clusters
+    with h5py.File(hdf5_path, "r") as h5f:
+        activations_dataset = h5f["activations"]
+        activations = activations_dataset[:]
+
+    # Normalize activations before PCA
+    normalized_activations = normalize(activations, axis=1, norm="l2")
+
+    # Reduce dimensionality with PCA
+    pca = PCA(n_components=2)
+    reduced_activations = pca.fit_transform(normalized_activations)
+
+    # Assign cluster labels
+    cluster_labels = kmeans.predict(normalized_activations)
+
+    # Scatter plot
     plt.figure(figsize=(10, 7))
     for cluster in np.unique(cluster_labels):
-        cluster_points = reduced_features[cluster_labels == cluster]
+        cluster_points = reduced_activations[cluster_labels == cluster]
         plt.scatter(cluster_points[:, 0], cluster_points[:, 1], label=f"Cluster {cluster}")
-    plt.title("Feature Direction Clusters")
+    plt.title("Spherical K-Means Cluster Visualization")
     plt.xlabel("PCA Component 1")
     plt.ylabel("PCA Component 2")
     plt.legend()
-    
-    # Save the plot instead of showing it
-    output_path = "feature_clusters.png"
     plt.savefig(output_path)
-    plt.close()  # Close the figure to free memory
+    plt.close()
     print(f"Cluster visualization saved to {output_path}")
+
 
 checkpoint_path = '/home/tazik/MindEyeV2/train_logs/final_subj01_pretrained_1sess_24bs/last_20241121-073319.pth'
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 sae = load_sae_from_checkpoint(checkpoint_path, device=device)
 
 # Load test data
-num_test = 3000
+#num_test = 3000
+num_test = 10
+
 subj = 1
 data_path = os.getcwd()
+
+def print_memory_stats(stage):
+    print(f"\n[Memory Stats: {stage}]")
+    print(f"Allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+    print(f"Reserved: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
+    print(f"Max Reserved: {torch.cuda.max_memory_reserved() / 1e9:.2f} GB\n")
 
 def analyze_decoder_weights(sae_model):
     # Get the decoder weights
     decoder_weights = sae_model.decoder.weight.detach()
-    # Compute L2 norm for each weight vector
-    l2_norms = torch.norm(decoder_weights, dim=1).cpu().numpy()
-    return l2_norms
+    
+    # Compute L0, L1, and L2 norms
+    l0_norms = (decoder_weights != 0).sum(dim=1).float().cpu().numpy()
+    l1_norms = torch.norm(decoder_weights, p=1, dim=1).cpu().numpy()
+    l2_norms = torch.norm(decoder_weights, p=2, dim=1).cpu().numpy()
+    
+    return l0_norms, l1_norms, l2_norms
 
-# Assuming 'sae' is your loaded SAE model
-l2_norms = analyze_decoder_weights(sae)
+# # Calculate all norms
+# l0_norms, l1_norms, l2_norms = analyze_decoder_weights(sae)
 
-# Create a histogram using Plotly
-fig = px.histogram(
-    x=l2_norms,
-    nbins=50,
-    title="L2 Norm of Decoder Weights",
-    labels={"x": "L2 Norm", "y": "Count"},
-    template="plotly_dark",
-    opacity=0.7
-)
-fig.update_traces(marker_color="blue")
-fig.update_layout(xaxis_title="L2 Norm", yaxis_title="Count")
+# # Create a DataFrame from the norms
+# df = pd.DataFrame({
+#     'Norm Value': np.concatenate([l0_norms, l1_norms, l2_norms]),
+#     'Norm Type': ['L0'] * len(l0_norms) + ['L1'] * len(l1_norms) + ['L2'] * len(l2_norms)
+# })
 
-# Save the plot as an image
-output_path = "l2_norm_decoder_weights.png"
-fig.write_image(output_path)
+# # Create subplots for all three norms
+# fig = px.histogram(
+#     data_frame=df,
+#     x='Norm Value',
+#     color='Norm Type',
+#     nbins=50,
+#     title="Distribution of Decoder Weight Norms",
+#     labels={"Norm Value": "Norm Value", "count": "Count"},
+#     template="plotly_dark",
+#     opacity=0.7,
+#     color_discrete_sequence=["red", "green", "blue"],
+#     facet_col='Norm Type'
+# )
 
-print(f"Plot saved to {output_path}")
+
+# # Update layout
+# fig.update_layout(
+#     showlegend=False,
+#     title_x=0.5,
+#     height=400,
+#     width=1200
+# )
+
+# # Update x-axis titles
+# for i in range(3):
+#     fig.update_xaxes(title_text=f"L{i} Norm", col=i+1)
+
+# # Save the plot as an image
+# output_path = "decoder_weight_norms.png"
+# fig.write_image(output_path)
+
+# print(f"Plot saved to {output_path}")
 
 test_url = f"{data_path}/wds/subj0{subj}/new_test/" + "0.tar"
 test_data = wds.WebDataset(test_url,resampled=False,nodesplitter=my_split_by_node)\
@@ -285,34 +484,43 @@ clip_embedder = FrozenOpenCLIPImageEmbedder(
     only_tokens=True,
 ).to(device).eval()
 
+# 1. Load Images
 f = h5py.File(f'{data_path}/coco_images_224_float16.hdf5', 'r')
 images = f['images']
 
-# Extract feature directions F
+# 2. Extract Feature Directions
 feature_directions = extract_feature_directions(sae)  # Shape: [input_dim, hidden_dim]
 
-# Extract activations A
-activations = extract_sae_activations(sae, test_dl, images, clip_embedder, device)  # Shape: [num_samples, hidden_dim]
+# 3. Save Activations Incrementally to HDF5
+hdf5_path = "activations.h5"
 
-# Normalize feature directions to unit length
-from sklearn.preprocessing import normalize
+print("Before extracting SAE activations....")
+extract_sae_activations(sae, test_dl, images, clip_embedder, device, accelerator, hdf5_path)
 
-normalized_feature_directions = normalize(feature_directions, axis=0, norm='l2')  # Shape: [input_dim, hidden_dim]
+# 4. Normalize Feature Directions
+normalized_feature_directions = normalize(feature_directions, axis=0, norm="l2")  # Shape: [input_dim, hidden_dim]
 
-
-# Since activations are per sample, but feature directions are per feature, compute the average activation for each feature across the dataset:
-# Compute average activation per feature across all samples
-average_activations = activations.mean(axis=0)  # Shape: [hidden_dim]
-
-k_range = range(2, 20)  # Adjust as needed
+# 5. Compute Average Activations and Total Activation
+with h5py.File(hdf5_path, "r") as h5f:
+    activations_dataset = h5f["activations"]
+    average_activations = activations_dataset[:].mean(axis=0)
 total_activation = average_activations.sum()
-tau = 0.1 * total_activation  # For example, set tau as 10% of total activation
+tau = 0.1 * total_activation  # Set threshold to 10% of total activation
 
-clustering_result = spherical_kmeans(normalized_feature_directions, average_activations, k_range, tau)
+# 6. Perform Incremental Spherical K-Means
+k_range = range(2, 20)  # Cluster numbers to evaluate
+batch_size = 256
+clustering_result = incremental_spherical_kmeans_with_mass(
+    hdf5_path=hdf5_path,
+    features=normalized_feature_directions,
+    k_range=k_range,
+    tau=tau,
+    batch_size=batch_size
+)
 
-best_k = clustering_result['best_k']
-cluster_labels = clustering_result['cluster_labels']
+best_k = clustering_result["best_k"]
+cluster_labels = clustering_result["cluster_labels"]
+print(f"Optimal number of clusters: {best_k}")
 
-print(f"Selected best_k = {best_k}")
-
-visualize_clusters(normalized_feature_directions.T, cluster_labels) 
+# 7. Visualize Clusters
+visualize_clusters(hdf5_path, clustering_result)
