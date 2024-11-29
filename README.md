@@ -5,14 +5,28 @@ sudo apt-get install python3.11-dev
 cd MindEyeV2/src/
 source fmri/bin/activate
 
+# Pre-requisites 
+Run these first
+
 export GLOBAL_BATCH_SIZE=8
 export DS_SKIP_CUDA_CHECK=1
 
-### 4 GPUs
+### Visualizing SAE
+sbatch --job-name=mindeye_train --output=output_%j.log --error=error_%j.log --ntasks=1 --gpus=2 --cpus-per-task=16 --mem=128G --time=8:00:00 --partition=general --wrap="CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --mixed_precision=bf16 --num_processes 2 viz1.py"
+
+### Training SAE
+*4 GPUs*
 sbatch --job-name=mindeye_train --output=output_%j.log --error=error_%j.log --ntasks=1 --gpus=4 --cpus-per-task=16 --mem=128G --time=8:00:00 --partition=general --wrap="CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --mixed_precision=bf16 --num_processes 2 Train.py --model_name=final_subj01_pretrained_1sess_24bs --no-multi_subject --subj=1 --batch_size=2 --max_lr=3e-4 --mixup_pct=.33 --num_epochs=150 --use_prior --prior_scale=30 --clip_scale=1 --no-blurry_recon --blur_scale=.5 --no-use_image_aug --n_blocks=4 --hidden_dim=1024 --num_sessions=1 --wandb_log"
 
-### 2 GPUs
+*2 GPUs*
 sbatch --job-name=mindeye_train --output=output_%j.log --error=error_%j.log --ntasks=1 --gpus=2 --cpus-per-task=16 --mem=128G --time=8:00:00 --partition=general --wrap="CUDA_VISIBLE_DEVICES=0,1 accelerate launch --mixed_precision=bf16 --num_processes 2 Train.py --model_name=final_subj01_pretrained_1sess_24bs --no-multi_subject --subj=1 --batch_size=1 --max_lr=3e-4 --mixup_pct=.33 --num_epochs=150 --use_prior --prior_scale=30 --clip_scale=1 --no-blurry_recon --blur_scale=.5 --no-use_image_aug --n_blocks=4 --hidden_dim=1024 --num_sessions=1 --wandb_log"
+
+### Pictures
+
+![Cluster with 2 PCA features](./src/sae_activations/spherical_kmeans_visualization.png)
+
+![L2 Norm of Decoder Weights](./src/l2_norm_decoder_weights.png)
+
 
 # MindEye2
 
