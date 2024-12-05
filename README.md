@@ -2,6 +2,7 @@
 
 sudo apt-get install python3.11-dev 
 
+tmux
 cd MindEyeV2/src/
 source fmri/bin/activate
 

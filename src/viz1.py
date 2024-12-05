@@ -273,11 +273,9 @@ def spherical_kmeans_with_activation_mass(
     """
     Perform spherical k-means and select the optimal k based on activation mass threshold.
     """
-    print(f"Features shape before normalization: {features.shape}")
     
     # Normalize features to unit length
     normalized_features = normalize(features, axis=1, norm="l2")  # Shape: [input_dim, hidden_dim]
-    print(f"Normalized features shape: {normalized_features.shape}")
 
     best_k = None
     all_labels = []  # Store all labels for visualization
@@ -316,7 +314,6 @@ def spherical_kmeans_with_activation_mass(
 
                 # Flatten chunk for clustering
                 reshaped_chunk = chunk.reshape(-1, chunk.shape[-1])  # Shape: (60 * 256, 106496)
-                print(f"[DEBUG] Predicting Labels: Chunk shape: {reshaped_chunk.shape}")
 
                 labels = kmeans.predict(reshaped_chunk)  # Predict labels for flattened chunk
                 chunk_labels.append(labels)  # Collect labels for this chunk
@@ -324,12 +321,10 @@ def spherical_kmeans_with_activation_mass(
                 # Compute activation mass for each cluster
                 for cluster_idx in range(k):
                     cluster_mask = labels == cluster_idx  # Boolean mask for the current cluster
-                    print(f"[DEBUG] Cluster Mask: Cluster mask sum: {cluster_mask.sum()}, Mask shape: {cluster_mask.shape}")
 
                     if cluster_mask.sum() > 0:  # Avoid empty clusters
                         cluster_activation_masses[cluster_idx] += reshaped_chunk[cluster_mask].sum()
 
-                print(f"[DEBUG] Completed Chunk: Start idx: {start_idx}, End idx: {end_idx}")
 
         all_labels.extend(np.concatenate(chunk_labels))
         print(f"Final Cluster Activation Masses: {cluster_activation_masses}")
@@ -353,13 +348,11 @@ def visualize_clusters(hdf5_path, clustering_result, output_path=None):
     with h5py.File(hdf5_path, "r") as h5f:
         activations_dataset = h5f["activations"]
         activations = activations_dataset[:]
-        print(f"[DEBUG] Loaded Activations Shape: {activations.shape}")
 
     # Flatten or aggregate activations
     if activations.ndim == 3:
         # Option 1: Flatten
         flattened_activations = activations.reshape(-1, activations.shape[-1])  # (60 * 256, 106496)
-        print(f"[DEBUG] Flattened Activations Shape: {flattened_activations.shape}")
         normalized_activations = normalize(flattened_activations, axis=1, norm="l2")
 
         # If clustering labels need alignment with flattened activations
@@ -377,7 +370,6 @@ def visualize_clusters(hdf5_path, clustering_result, output_path=None):
     # Reduce dimensionality with PCA
     pca = PCA(n_components=2)
     reduced_activations = pca.fit_transform(normalized_activations)
-    print(f"[DEBUG] Reduced Activations Shape (PCA): {reduced_activations.shape}")
 
     # Use the cluster labels from clustering_result
     unique_labels = np.unique(cluster_labels)
@@ -396,17 +388,114 @@ def visualize_clusters(hdf5_path, clustering_result, output_path=None):
     plt.close()
     print(f"Cluster visualization saved to {output_path}")
 
+# Step 6
+def get_top_activating_images(hdf5_path, cluster_labels, num_top=20):
+    import logging
+    logging.basicConfig(level=logging.DEBUG)
 
-checkpoint_path = '/home/tazik/MindEyeV2/train_logs/final_subj01_pretrained_1sess_24bs/last_20241121-073319.pth'
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-sae = load_sae_from_checkpoint(checkpoint_path, device=device)
+    with h5py.File(hdf5_path, "r") as h5f:
+        activations_dataset = h5f["activations"]
+        activations = activations_dataset[:]
+        logging.debug(f"Loaded activations shape: {activations.shape}")
 
-# Load test data
-#num_test = 3000
-num_test = 10
+    # Ensure cluster_labels matches the shape of activations
+    if activations.ndim == 3:  # e.g., (60, 256, hidden_dim)
+        flattened_activations = activations.reshape(-1, activations.shape[-1])  # (60 * 256, hidden_dim)
+        logging.debug(f"Flattened activations shape: {flattened_activations.shape}")
+        if len(cluster_labels) != flattened_activations.shape[0]:
+            raise ValueError(
+                f"Cluster labels shape {cluster_labels.shape} does not match flattened activations {flattened_activations.shape[0]}"
+            )
+        activations = flattened_activations  # Use flattened activations for indexing
 
-subj = 1
-data_path = os.getcwd()
+    logging.debug(f"Final activations shape: {activations.shape}")
+    logging.debug(f"Cluster labels shape: {cluster_labels.shape}")
+
+    # Map each cluster to its top activating samples
+    top_images_per_cluster = {}
+    for cluster in np.unique(cluster_labels):
+        cluster_mask = (cluster_labels == cluster)
+        logging.debug(f"Cluster {cluster}: Mask shape: {cluster_mask.shape}, Total true: {np.sum(cluster_mask)}")
+
+        # Check if the mask aligns with activations
+        if len(cluster_mask) != activations.shape[0]:
+            raise IndexError(
+                f"Cluster mask shape {cluster_mask.shape} does not match activations shape {activations.shape[0]}"
+            )
+
+        cluster_activations = activations[cluster_mask]
+        logging.debug(f"Cluster {cluster}: Activations shape: {cluster_activations.shape}")
+
+        # Compute activation norms (magnitude) for each activation
+        activation_norms = np.linalg.norm(cluster_activations, axis=1)
+        logging.debug(f"Cluster {cluster}: Activation norms computed, shape: {activation_norms.shape}")
+
+        # Get indices of top activations
+        top_indices = np.argsort(activation_norms)[-num_top:]
+        logging.debug(f"Cluster {cluster}: Top indices: {top_indices}")
+
+        top_images_per_cluster[cluster] = top_indices
+
+    return top_images_per_cluster
+
+
+# Visualize top images
+def visualize_top_images(top_images, images_dataset, output_dir="cluster_visualizations"):
+    os.makedirs(output_dir, exist_ok=True)
+    
+    for cluster, indices in top_images.items():
+        fig, axes = plt.subplots(1, len(indices), figsize=(15, 5))
+        
+        for i, idx in enumerate(indices):
+            image = images_dataset[idx]  # Load image from dataset
+            
+            # Debug: Print the shape and dtype of each image
+            print(f"Processing image {idx} in cluster {cluster}: Shape: {image.shape}, Dtype: {image.dtype}")
+            
+            # Ensure the data shape is (H, W, C)
+            if image.shape == (3, 224, 224):  # Channel-first
+                image = image.transpose(1, 2, 0)  # Convert to (H, W, C)
+            
+            # Ensure data type is compatible
+            if image.dtype not in [np.uint8, np.int16, np.float32, np.float64]:
+                if image.max() > 1.0:  # Assuming it's in the range of 0-255
+                    image = image.astype(np.float32) / 255.0  # Normalize to 0-1 range
+                else:
+                    image = image.astype(np.float32)  # Directly convert to float32
+            
+            # Ensure valid range for float images
+            if image.dtype in [np.float32, np.float64]:
+                image = np.clip(image, 0.0, 1.0)  # Clip values to [0, 1]
+
+            # Plot the image
+            axes[i].imshow(image)
+            axes[i].axis("off")
+        
+        plt.suptitle(f"Cluster {cluster}: Top Activating Images")
+        output_path = os.path.join(output_dir, f"cluster_{cluster}_top_images.png")
+        plt.savefig(output_path)
+        plt.close()
+        print(f"Saved visualization for cluster {cluster} to {output_path}")
+
+# Step 7: Manipulate Feature Directions for Image Generation
+def manipulate_embedding(base_embedding, feature_direction, scale=5.0):
+    """
+    Manipulate the base embedding with a feature direction scaled by a factor.
+    """
+    print(f"Base embedding shape: {base_embedding.shape}")
+    print(f"Feature direction shape: {feature_direction.shape}")
+    manipulated_embedding = base_embedding + scale * feature_direction
+    return manipulated_embedding
+
+def generate_images_with_modified_embeddings(manipulated_embedding, diffusion_model):
+    """
+    Generate images using the manipulated embedding with a diffusion model.
+    """
+    with torch.no_grad():
+        # Assuming diffusion_model has a method for generating images from embeddings
+        generated_images = diffusion_model.generate_from_embedding(manipulated_embedding)
+    return generated_images
+
 
 def print_memory_stats(stage):
     print(f"\n[Memory Stats: {stage}]")
@@ -424,6 +513,17 @@ def analyze_decoder_weights(sae_model):
     l2_norms = torch.norm(decoder_weights, p=2, dim=1).cpu().numpy()
     
     return l0_norms, l1_norms, l2_norms
+
+checkpoint_path = '/home/tazik/MindEyeV2/train_logs/final_subj01_pretrained_1sess_24bs/last_20241121-073319.pth'
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+sae = load_sae_from_checkpoint(checkpoint_path, device=device)
+
+# Load test data
+#num_test = 3000
+num_test = 10
+
+subj = 1
+data_path = os.getcwd()
 
 # # Calculate all norms
 # l0_norms, l1_norms, l2_norms = analyze_decoder_weights(sae)
@@ -554,3 +654,13 @@ print(f"Optimal number of clusters: {best_k}")
 # Visualize Clusters
 if clustering_result["best_k"] is not None:
     visualize_clusters(merged_file, clustering_result)
+
+top_images = get_top_activating_images(merged_file, clustering_result["cluster_labels"])
+
+# Define output directory for cluster visualizations
+output_dir = os.path.join(os.getcwd(), "cluster_visualizations")
+
+# Visualize top images for each cluster
+visualize_top_images(top_images, images, output_dir)
+
+print(f"Cluster visualizations saved to {output_dir}")
