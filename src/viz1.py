@@ -4,6 +4,7 @@ from datetime import timedelta
 import sys
 import torch
 from models import SAE, MindEyeModule, RidgeRegression, BrainNetwork, BrainDiffusionPrior, PriorNetwork
+from matplotlib.offsetbox import OffsetImage, AnnotationBbox
 import webdataset as wds
 import matplotlib.pyplot as plt
 import random
@@ -477,6 +478,81 @@ def visualize_top_images(top_images, images_dataset, output_dir="cluster_visuali
         plt.close()
         print(f"Saved visualization for cluster {cluster} to {output_path}")
 
+def visualize_clusters_with_images(hdf5_path, clustering_result, images, top_images, output_path=None):
+    """
+    Visualize clusters with actual images instead of abstract points.
+    """
+    if output_path is None:
+        output_path = os.path.join(os.path.dirname(hdf5_path), "cluster_image_visualization.png")
+
+    # Load activations
+    with h5py.File(hdf5_path, "r") as h5f:
+        activations_dataset = h5f["activations"]
+        activations = activations_dataset[:]
+        print(f"Loaded activations shape: {activations.shape}")  # Debugging info
+
+    # Flatten activations if necessary
+    if activations.ndim == 3:
+        activations = activations.reshape(-1, activations.shape[-1])  # Flatten 3D to 2D
+        print(f"Flattened activations shape: {activations.shape}")  # Debugging info
+
+    # Reduce dimensionality with PCA
+    pca = PCA(n_components=2)
+    reduced_activations = pca.fit_transform(activations)
+
+    # Use cluster labels from the result
+    cluster_labels = clustering_result["cluster_labels"]
+
+    # Set up the plot
+    plt.figure(figsize=(15, 10))
+    ax = plt.gca()
+
+    # Loop through each cluster
+    unique_labels = set(cluster_labels)
+    for cluster in unique_labels:
+        # Find the points in this cluster
+        cluster_points = reduced_activations[cluster_labels == cluster]
+        
+        # Plot cluster points
+        plt.scatter(cluster_points[:, 0], cluster_points[:, 1], label=f"Cluster {cluster}", alpha=0.5)
+
+        # Add representative images as annotations
+        if cluster in top_images:
+            for idx in top_images[cluster]:
+                image = np.array(images[idx])
+
+                image = image.astype(np.float32)
+
+                if image.shape[0] == 3:  # If channel-first
+                    image = image.transpose(1, 2, 0)
+                
+                # Ensure image values are in [0, 1] range
+                if image.max() > 1.0:
+                    image = image / 255.0
+                # Find the position of this image in reduced space
+                position = reduced_activations[idx]
+                
+                # Add the image to the plot
+                try:
+                    image_box = OffsetImage(image, zoom=0.1)
+                    annotation = AnnotationBbox(image_box, position, frameon=False)
+                    ax.add_artist(annotation)
+                except Exception as e:
+                    # CHANGE 7: Added detailed error reporting
+                    print(f"Failed to add image {idx} to plot: {e}")
+                    print(f"Image shape: {image.shape}, dtype: {image.dtype}, range: [{image.min()}, {image.max()}]")
+                    continue
+
+    # Finalize plot
+    plt.title("Cluster Visualization with Representative Images")
+    plt.xlabel("PCA Component 1")
+    plt.ylabel("PCA Component 2")
+    plt.legend()
+    plt.savefig(output_path)
+    plt.close()
+
+    print(f"Cluster visualization saved to {output_path}")
+
 # Step 7: Manipulate Feature Directions for Image Generation
 def manipulate_embedding(base_embedding, feature_direction, scale=5.0):
     """
@@ -664,3 +740,12 @@ output_dir = os.path.join(os.getcwd(), "cluster_visualizations")
 visualize_top_images(top_images, images, output_dir)
 
 print(f"Cluster visualizations saved to {output_dir}")
+
+# Generate cluster visualization with representative images
+visualize_clusters_with_images(
+    hdf5_path=merged_file,
+    clustering_result=clustering_result,
+    images=images,  # Pass the actual images array
+    top_images=top_images,  # Dictionary from get_top_activating_images
+    output_path="cluster_image_visualization.png"
+)
