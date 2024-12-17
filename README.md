@@ -1,5 +1,25 @@
 # Log
 
+## Prior Work: MindEye2
+- [MindEye2](https://arxiv.org/abs/2403.11207) reconstructs images from fMRI scans
+- MindEye2 = fMRI-CLIP + diffusion
+- fmRICLIP = shared latent space for fMRI latents (rather than text) and images
+- diffusion denoises this representation
+
+## Prior Work: SAEs for CLIP
+- [Daujotas et al](https://www.lesswrong.com/posts/iYFuZo9BMvr6GgMs5/case-study-interpreting-manipulating-and-controlling-clip) train SAEs on CLIP
+- SAEs allow visualizations + steering in feature space, which offers finer grained control
+
+## Current Work: SAEs for fMRI-CLIP
+- CLIP has dot product of text caption and image alignment as its loss; this naturally leads to semantic and not just perceptual clustering
+- fMRI-CLIP (in MindEye2) was trained on flattened fMRI voxels from the occipital lobe, which is only involved in raw perception, and not later stages of visual analysis in the brain.
+- Hypothesis: fMRI-CLIP "loses" the semantic edge of CLIP, and is thus more like a vanilla vision model
+
+## Current Work: Experiments
+- We apply the k-spherical means clustering from Daujotas et al to MindEye2's CLIP module
+- Because of compute limitations, have only run this on 1% of activations so far:
+- WIP: what do the k=2 clusters below represent? how does this show evidence for/against hypothesis?
+- WIP: improve cluster visualization
 
 ![Cluster with images overlaid](./src/cluster_image_visualization.png)
 
